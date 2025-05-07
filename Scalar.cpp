@@ -1,274 +1,231 @@
 #include <iostream>
-#include <fstream>
 #include <vector>
 #include <queue>
-#include <climits>
-#include <string>
+#include <fstream>
 #include <sstream>
+#include <string>
 #include <algorithm>
+#include <climits>
+#include <chrono>
+#include <map>
 
 using namespace std;
 
-// Edge structure
 struct Edge {
-    int dest, weight;
-    Edge(int d, int w) : dest(d), weight(w) {}
+    int src, dest;
+    vector<int> weights;
+    Edge(int s, int d, const vector<int>& w) : src(s), dest(d), weights(w) {}
 };
 
-// Graph class
 class Graph {
-    int V; // Number of vertices
-    vector<vector<Edge>> adj; // Adjacency list
-    vector<vector<int>> sosp; // Store SOSP for each objective
-    vector<vector<int>> mosp; // Store MOSP paths
-
 public:
-    Graph() : V(0) {}
+    int V;
+    int numObjectives;
+    vector<vector<Edge>> adj;
 
-    // Determine number of vertices and initialize adjacency list
-    bool initializeGraph(const string& filename) {
-        ifstream file(filename);
-        if (!file.is_open()) {
-            cout << "Error opening file!" << endl;
-            return false;
-        }
+    Graph(int vertices = 0, int objectives = 2) : V(vertices), numObjectives(objectives) {
+        adj.resize(V);
+    }
 
-        int max_vertex = 0;
-        string line;
-        int src, dest, weight;
-        vector<tuple<int, int, int>> edges;
-
-        // First pass: determine max vertex
-        while (getline(file, line)) {
-            istringstream iss(line);
-            if (!(iss >> src >> dest >> weight)) {
-                cout << "Invalid line format: " << line << endl;
-                continue;
-            }
-            if (src < 0 || dest < 0 || weight < 0) {
-                cout << "Invalid data: " << src << " " << dest << " " << weight << endl;
-                continue;
-            }
-            max_vertex = max({ max_vertex, src, dest });
-            edges.emplace_back(src, dest, weight);
-        }
-        file.close();
-
-        // Initialize graph with max_vertex + 1 vertices
-        V = max_vertex + 1;
-        adj.assign(V, vector<Edge>());
-
-        // Second pass: populate adjacency list
-        for (const auto& [src, dest, w] : edges) {
-            addEdge(src, dest, w);
-        }
-
+    bool addEdge(int src, int dest, const vector<int>& weights) {
+        if (src >= V || dest >= V) return false;
+        adj[src].emplace_back(src, dest, weights);
         return true;
     }
 
-    // Add edge to graph
-    void addEdge(int src, int dest, int weight) {
-        if (src >= V || dest >= V) {
-            int new_V = max(src, dest) + 1;
-            adj.resize(new_V);
-            V = new_V;
-        }
-        adj[src].emplace_back(dest, weight);
-        adj[dest].emplace_back(src, weight); // Undirected graph
+    bool removeEdge(int src, int dest) {
+        if (src >= V || dest >= V) return false;
+        auto& edges = adj[src];
+        size_t before = edges.size();
+        edges.erase(remove_if(edges.begin(), edges.end(),
+            [dest](const Edge& e) { return e.dest == dest; }), edges.end());
+        return edges.size() < before;
     }
 
-    // Dijkstra's algorithm for SOSP
-    vector<int> dijkstra(int src, int objective) {
-        vector<int> dist(V, INT_MAX);
-        vector<int> parent(V, -1);
-        priority_queue<pair<int, int>, vector<pair<int, int>>, greater<>> pq;
-
-        dist[src] = 0;
-        pq.emplace(0, src);
-
-        while (!pq.empty()) {
-            int u = pq.top().second;
-            int d = pq.top().first;
-            pq.pop();
-
-            if (d > dist[u]) continue;
-
-            for (const auto& edge : adj[u]) {
-                int v = edge.dest;
-                int weight = edge.weight;
-
-                if (dist[u] + weight < dist[v]) {
-                    dist[v] = dist[u] + weight;
-                    parent[v] = u;
-                    pq.emplace(dist[v], v);
-                }
-            }
+    bool readGraph(const string& filename) {
+        ifstream infile(filename);
+        if (!infile.is_open()) return false;
+        string line;
+        int maxNode = -1;
+        vector<Edge> tempEdges;
+        while (getline(infile, line)) {
+            istringstream iss(line);
+            int src, dest;
+            vector<int> weights;
+            iss >> src >> dest;
+            int w;
+            while (iss >> w) weights.push_back(w);
+            if (weights.size() > numObjectives) numObjectives = weights.size();
+            maxNode = max({ maxNode, src, dest });
+            tempEdges.emplace_back(src, dest, weights);
         }
-        return parent;
-    }
-
-    // Print path from source to destination
-    void printPath(const vector<int>& parent, int dest) {
-        if (dest == -1) return;
-        vector<int> path;
-        int current = dest;
-        while (current != -1) {
-            path.push_back(current);
-            current = parent[current];
+        infile.close();
+        V = maxNode + 1;
+        adj.assign(V, vector<Edge>());
+        for (const auto& e : tempEdges) {
+            adj[e.src].push_back(e);
         }
-        reverse(path.begin(), path.end());
-        for (size_t i = 0; i < path.size(); ++i) {
-            cout << path[i];
-            if (i < path.size() - 1) cout << " -> ";
-        }
-        cout << endl;
-    }
-
-    // Merge SOSP trees to create combined graph
-    vector<vector<Edge>> mergeSOSP(const vector<vector<int>>& sosp_trees) {
-        vector<vector<Edge>> combined_graph(V);
-        vector<vector<int>> weight_count(V, vector<int>(V, 0));
-
-        // Count occurrences of edges in SOSP trees
-        for (const auto& tree : sosp_trees) {
-            for (int v = 0; v < V; ++v) {
-                int u = v;
-                while (tree[u] != -1) {
-                    int parent = tree[u];
-                    weight_count[min(u, parent)][max(u, parent)]++;
-                    u = parent;
-                }
-            }
-        }
-
-        // Create combined graph with weights based on occurrence
-        for (int u = 0; u < V; ++u) {
-            for (const auto& edge : adj[u]) {
-                int v = edge.dest;
-                int count = weight_count[min(u, v)][max(u, v)];
-                if (count > 0) {
-                    combined_graph[u].emplace_back(v, edge.weight / count);
-                }
-            }
-        }
-        return combined_graph;
-    }
-
-    // Compute MOSP
-    void computeMOSP(int src, const vector<int>& objectives) {
-        sosp.clear();
-        for (int obj : objectives) {
-            sosp.push_back(dijkstra(src, obj));
-        }
-
-        // Print SOSP paths for each objective
-        for (size_t i = 0; i < sosp.size(); ++i) {
-            cout << "SOSP for objective " << objectives[i] << " from vertex " << src << ":\n";
-            for (int v = 0; v < V; ++v) {
-                if (v != src && sosp[i][v] != -1) {
-                    cout << "Path to " << v << ": ";
-                    printPath(sosp[i], v);
-                }
-            }
-        }
-
-        // Merge SOSP trees
-        auto combined_graph = mergeSOSP(sosp);
-
-        // Compute SOSP on combined graph
-        Graph temp_graph;
-        temp_graph.V = V;
-        temp_graph.adj.assign(V, vector<Edge>());
-        for (int u = 0; u < V; ++u) {
-            for (const auto& edge : combined_graph[u]) {
-                temp_graph.addEdge(u, edge.dest, edge.weight);
-            }
-        }
-        mosp = { temp_graph.dijkstra(src, 0) };
-
-        // Print MOSP paths
-        cout << "MOSP paths from vertex " << src << ":\n";
-        for (const auto& path : mosp) {
-            for (int v = 0; v < V; ++v) {
-                if (v != src && path[v] != -1) {
-                    cout << "Path to " << v << ": ";
-                    printPath(path, v);
-                }
-            }
-        }
-
-        // Pareto optimality check
-        vector<vector<int>> pareto_paths;
-        for (const auto& path : mosp) {
-            bool dominated = false;
-            for (const auto& other_path : mosp) {
-                if (&path == &other_path) continue;
-                // Simplified dominance check (extend for multiple objectives)
-                dominated = false; // Placeholder, assume non-dominated for single objective
-            }
-            if (!dominated) {
-                pareto_paths.push_back(path);
-            }
-        }
-        mosp = pareto_paths;
-    }
-
-    // Delete edge
-    void deleteEdge(int src, int dest) {
-        if (src >= V || dest >= V) return;
-        adj[src].erase(remove_if(adj[src].begin(), adj[src].end(),
-            [dest](const Edge& e) { return e.dest == dest; }), adj[src].end());
-        adj[dest].erase(remove_if(adj[dest].begin(), adj[dest].end(),
-            [src](const Edge& e) { return e.dest == src; }), adj[dest].end());
-    }
-
-    // User menu
-    void userMenu() {
-        int choice, src, dest, weight;
-        vector<int> objectives = { 0 }; // Example objectives
-        while (true) {
-            cout << "\n1. Insert edge\n2. Delete edge\n3. Compute MOSP\n4. Exit\nChoice: ";
-            cin >> choice;
-            if (choice == 4) break;
-
-            switch (choice) {
-            case 1:
-                cout << "Enter src dest weight: ";
-                cin >> src >> dest >> weight;
-                if (src >= 0 && dest >= 0 && weight >= 0) {
-                    addEdge(src, dest, weight);
-                    computeMOSP(0, objectives); // Update MOSP
-                }
-                else {
-                    cout << "Invalid input!" << endl;
-                }
-                break;
-            case 2:
-                cout << "Enter src dest: ";
-                cin >> src >> dest;
-                if (src >= 0 && dest >= 0) {
-                    deleteEdge(src, dest);
-                    computeMOSP(0, objectives); // Update MOSP
-                }
-                else {
-                    cout << "Invalid input!" << endl;
-                }
-                break;
-            case 3:
-                computeMOSP(0, objectives);
-                cout << "MOSP computed. Pareto optimal paths stored." << endl;
-                break;
-            default:
-                cout << "Invalid choice!" << endl;
-            }
-        }
+        return true;
     }
 };
 
-int main() {
-    Graph g;
-    if (g.initializeGraph("weightedfacebook_graph.txt")) {
-        g.userMenu();
+struct SOSP_Tree {
+    vector<int> distance;
+    vector<int> parent;
+    SOSP_Tree(int V) : distance(V, INT_MAX), parent(V, -1) {}
+};
+
+SOSP_Tree dijkstra(const Graph& G, int src, int objective) {
+    SOSP_Tree tree(G.V);
+    tree.distance[src] = 0;
+    priority_queue<pair<int, int>, vector<pair<int, int>>, greater<>> pq;
+    pq.push({ 0, src });
+    while (!pq.empty()) {
+        int d = pq.top().first, u = pq.top().second; pq.pop();
+        if (d > tree.distance[u]) continue;
+        for (const auto& edge : G.adj[u]) {
+            int v = edge.dest;
+            int weight = (objective < edge.weights.size()) ? edge.weights[objective] : edge.weights[0];
+            if (tree.distance[u] + weight < tree.distance[v]) {
+                tree.distance[v] = tree.distance[u] + weight;
+                tree.parent[v] = u;
+                pq.push({ tree.distance[v], v });
+            }
+        }
     }
+    return tree;
+}
+
+Graph buildEnsembleGraph(const vector<SOSP_Tree>& trees, const Graph& G) {
+    Graph ensemble(G.V, G.numObjectives);
+    map<pair<int, int>, int> count;
+
+    for (const auto& tree : trees) {
+        for (int v = 0; v < G.V; v++) {
+            int u = tree.parent[v];
+            if (u != -1) count[{u, v}]++;
+        }
+    }
+
+    for (const auto& kv : count) {
+        int u = kv.first.first;
+        int v = kv.first.second;
+        int freq = kv.second;
+        vector<int> weight = { G.numObjectives - freq + 1 };
+        ensemble.addEdge(u, v, weight);
+    }
+    return ensemble;
+}
+
+vector<int> reconstructPath(const SOSP_Tree& tree, int dest) {
+    vector<int> path;
+    for (int v = dest; v != -1; v = tree.parent[v]) path.push_back(v);
+    reverse(path.begin(), path.end());
+    return path;
+}
+
+void computeMOSP(Graph& G, int src, int dest) {
+    auto start = chrono::high_resolution_clock::now();
+
+    vector<SOSP_Tree> trees;
+    for (int i = 0; i < G.numObjectives; i++) {
+        trees.push_back(dijkstra(G, src, i));
+    }
+
+    Graph ensemble = buildEnsembleGraph(trees, G);
+    SOSP_Tree mospTree = dijkstra(ensemble, src, 0);
+    vector<int> path = reconstructPath(mospTree, dest);
+
+    auto end = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::milliseconds>(end - start);
+
+    vector<int> totalDistances(G.numObjectives, 0);
+    for (size_t i = 0; i < path.size() - 1; i++) {
+        int u = path[i];
+        int v = path[i + 1];
+        for (const auto& edge : G.adj[u]) {
+            if (edge.dest == v) {
+                for (int j = 0; j < G.numObjectives; j++) {
+                    totalDistances[j] += (j < edge.weights.size()) ? edge.weights[j] : edge.weights[0];
+                }
+                break;
+            }
+        }
+    }
+
+    // Console output
+    cout << "MOSP Path: ";
+    if (path.size() > 10) {
+        for (int i = 0; i < 5; i++) cout << path[i] << " ";
+        cout << "... ";
+        for (int i = path.size() - 5; i < path.size(); i++) cout << path[i] << " ";
+    } else {
+        for (int v : path) cout << v << " ";
+    }
+    cout << endl;
+
+    cout << "Distances for each objective:" << endl;
+    for (int i = 0; i < G.numObjectives; i++) {
+        cout << "Objective " << i + 1 << ": " << totalDistances[i] << endl;
+    }
+    cout << "Execution time: " << duration.count() << " ms" << endl;
+
+    // Save to file
+    ofstream out("mosp_result.txt");
+    out << "MOSP Path: ";
+    for (int v : path) out << v << " ";
+    out << endl;
+    for (int i = 0; i < G.numObjectives; i++) {
+        out << "Objective " << i + 1 << ": " << totalDistances[i] << endl;
+    }
+    out << "Execution time: " << duration.count() << " ms" << endl;
+    out.close();
+}
+
+void menu(Graph& G) {
+    int src = 0, dest = G.V - 1;
+    computeMOSP(G, src, dest);
+
+    int choice;
+    do {
+        cout << "\n1. Add Edge\n2. Delete Edge\n3. Exit\nChoice: ";
+        cin >> choice;
+        if (choice == 1) {
+            int e_src, e_dest;
+            vector<int> weights;
+            cout << "Enter src dest followed by " << G.numObjectives << " weights: ";
+            cin >> e_src >> e_dest;
+            for (int i = 0; i < G.numObjectives; i++) {
+                int w;
+                cin >> w;
+                weights.push_back(w);
+            }
+            if (G.addEdge(e_src, e_dest, weights)) {
+                cout << "Edge added. Recomputing MOSP...\n";
+                computeMOSP(G, src, dest);
+            }
+        } else if (choice == 2) {
+            int e_src, e_dest;
+            cout << "Enter src and dest to remove edge: ";
+            cin >> e_src >> e_dest;
+            if (G.removeEdge(e_src, e_dest)) {
+                cout << "Edge removed. Recomputing MOSP...\n";
+                computeMOSP(G, src, dest);
+            } else {
+                cout << "Edge not found.\n";
+            }
+        }
+    } while (choice != 3);
+}
+
+int main() {
+    Graph G;
+    string filename = "weightedfacebook_graph.txt";
+    if (!G.readGraph(filename)) {
+        cerr << "Error reading graph file.\n";
+        return 1;
+    }
+
+    menu(G);
     return 0;
 }
