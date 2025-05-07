@@ -1,365 +1,999 @@
-#include <mpi.h>
-#include <metis.h>
 #include <iostream>
-#include <fstream>
 #include <vector>
-#include <map>
-#include <set>
-#include <algorithm>
+#include <queue>
+#include <fstream>
 #include <sstream>
 #include <string>
-#include <climits>
+#include <unordered_map>
+#include <unordered_set>
+#include <limits>
+#include <algorithm>
+#include <chrono>
+#include <random>
+#include <mpi.h>
+#include <metis.h>
 
-using namespace std;
+// Custom hash for pair<int, int>
+struct pair_hash {
+    std::size_t operator()(const std::pair<int, int>& p) const {
+        return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 1);
+    }
+};
+
+// Enum for edge operation type
+enum EdgeOperation {
+    INSERT,
+    DELETE
+};
 
 // Structure to represent an edge
 struct Edge {
-    int dest;
-    int weight;
+    int src, dest;
+    std::vector<int> weights;
+
+    Edge() : src(0), dest(0), weights() {}
+    Edge(int s, int d, const std::vector<int>& w) : src(s), dest(d), weights(w) {}
 };
 
-// Structure to represent a path (for SOSP/MOSP)
-struct Path {
-    vector<int> nodes;
-    int total_weight;
-    bool operator<(const Path& other) const {
-        return total_weight < other.total_weight;
+// Structure to represent distance for multiple objectives
+struct Distance {
+    std::vector<int> values;
+    
+    Distance(int num_objectives, int value = std::numeric_limits<int>::max()) {
+        values.resize(num_objectives, value);
     }
-};
-
-// Function to read the graph (Master only)
-map<int, vector<Edge>> read_graph(const string& filename, int& num_vertices, int& num_edges) {
-    map<int, vector<Edge>> graph;
-    ifstream file(filename);
-    if (!file.is_open()) {
-        cerr << "Error opening file: " << filename << endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    string line;
-    num_edges = 0;
-    num_vertices = 0;
-    while (getline(file, line)) {
-        istringstream iss(line);
-        int src, dest, weight;
-        if (iss >> src >> dest >> weight) {
-            if (src < 0 || dest < 0) continue; // Skip invalid vertices
-            graph[src].push_back({dest, weight});
-            graph[dest]; // Ensure dest vertex exists
-            num_vertices = max({num_vertices, src + 1, dest + 1});
-            num_edges++;
+    
+    bool dominates(const Distance& other) const {
+        bool at_least_one_better = false;
+        for (size_t i = 0; i < values.size(); i++) {
+            if (values[i] > other.values[i]) return false;
+            if (values[i] < other.values[i]) at_least_one_better = true;
         }
+        return at_least_one_better;
     }
-    file.close();
-    if (num_vertices == 0) {
-        cerr << "Empty graph detected" << endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
+    
+    bool operator==(const Distance& other) const {
+        if (values.size() != other.values.size()) return false;
+        for (size_t i = 0; i < values.size(); i++) {
+            if (values[i] != other.values[i]) return false;
+        }
+        return true;
     }
-    return graph;
-}
+};
 
-// Convert graph to METIS format
-void graph_to_metis(const map<int, vector<Edge>>& graph, int num_vertices, vector<idx_t>& xadj, vector<idx_t>& adjncy, vector<idx_t>& adjwgt) {
-    xadj.clear();
-    adjncy.clear();
-    adjwgt.clear();
-    xadj.push_back(0);
-    for (int v = 0; v < num_vertices; ++v) {
-        auto it = graph.find(v);
-        if (it != graph.end()) {
-            for (const auto& edge : it->second) {
-                adjncy.push_back(edge.dest);
-                adjwgt.push_back(edge.weight);
+// Structure to represent a path with multiple objectives
+struct Path {
+    std::vector<int> nodes;
+    Distance dist;
+    
+    Path(int num_objectives) : dist(num_objectives) {}
+    Path(const std::vector<int>& n, const Distance& d) : nodes(n), dist(d) {}
+};
+
+// Class to represent a Graph
+class Graph {
+private:
+    int V;
+    int num_objectives;
+    std::vector<std::vector<Edge>> adj;
+    
+public:
+    Graph(int vertices, int objectives) : V(vertices), num_objectives(objectives) {
+        adj.resize(vertices);
+    }
+    
+    void addEdge(int src, int dest, const std::vector<int>& weights) {
+        if (weights.size() != num_objectives) {
+            std::cerr << "Error: Number of weights doesn't match the number of objectives" << std::endl;
+            return;
+        }
+        adj[src].push_back(Edge(src, dest, weights));
+    }
+    
+    void removeEdge(int src, int dest) {
+        auto& edges = adj[src];
+        edges.erase(std::remove_if(edges.begin(), edges.end(),
+                                   [dest](const Edge& e) { return e.dest == dest; }),
+                    edges.end());
+    }
+    
+    const std::vector<std::vector<Edge>>& getAdjList() const {
+        return adj;
+    }
+    
+    int getV() const {
+        return V;
+    }
+    
+    int getNumObjectives() const {
+        return num_objectives;
+    }
+    
+    std::pair<std::vector<int>, std::vector<int>> computeSOSP(int source, int objective_idx) {
+        std::vector<int> dist(V, std::numeric_limits<int>::max());
+        std::vector<int> pred(V, -1);
+        std::vector<bool> visited(V, false);
+        std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<>> pq;
+        
+        dist[source] = 0;
+        pq.push({0, source});
+        
+        while (!pq.empty()) {
+            int u = pq.top().second;
+            int u_dist = pq.top().first;
+            pq.pop();
+            
+            if (visited[u]) continue;
+            visited[u] = true;
+            
+            for (size_t i = 0; i < adj[u].size(); i++) {
+                const Edge& edge = adj[u][i];
+                int v = edge.dest;
+                int weight = edge.weights[objective_idx];
+                int new_dist = (u_dist == std::numeric_limits<int>::max() || weight == std::numeric_limits<int>::max()) 
+                              ? std::numeric_limits<int>::max() : u_dist + weight;
+                
+                if (!visited[v] && new_dist < dist[v]) {
+                    dist[v] = new_dist;
+                    pred[v] = u;
+                    pq.push({new_dist, v});
+                }
             }
         }
-        xadj.push_back(adjncy.size());
+        
+        return {dist, pred};
     }
-}
-
-// Partition graph using METIS
-void partition_graph(int num_vertices, int num_parts, vector<idx_t>& xadj, vector<idx_t>& adjncy, vector<idx_t>& adjwgt, vector<idx_t>& part) {
-    if (num_vertices == 0 || xadj.empty()) {
-        cerr << "Invalid graph for METIS partitioning" << endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    idx_t ncon = 1;
-    idx_t objval;
-    part.resize(num_vertices);
-    vector<idx_t> xadj_copy = xadj;
-    vector<idx_t> adjncy_copy = adjncy;
-    vector<idx_t> adjwgt_copy = adjwgt;
-    int ret = METIS_PartGraphKway(&num_vertices, &ncon, xadj_copy.data(), adjncy_copy.data(), nullptr, nullptr, adjwgt_copy.data(),
-                                  &num_parts, nullptr, nullptr, nullptr, &objval, part.data());
-    if (ret != METIS_OK) {
-        cerr << "METIS partitioning failed with code: " << ret << endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-}
-
-// Distribute partitions to MPI processes
-void distribute_partitions(const map<int, vector<Edge>>& full_graph, const vector<idx_t>& part, int rank, int size, map<int, vector<Edge>>& local_graph, vector<int>& local_vertices) {
-    local_graph.clear();
-    local_vertices.clear();
-    for (const auto& [v, edges] : full_graph) {
-        if (v < static_cast<int>(part.size()) && part[v] == rank) {
-            local_graph[v] = edges;
-            local_vertices.push_back(v);
-        }
-    }
-}
-
-// Compute partial SOSP on local partition (simplified Dijkstra-like)
-vector<Path> compute_sosp(const map<int, vector<Edge>>& local_graph, const vector<int>& local_vertices) {
-    vector<Path> sosp;
-    for (int src : local_vertices) {
-        map<int, int> dist;
-        map<int, vector<int>> pred;
-        set<pair<int, int>> pq; // {distance, vertex}
-        for (int v : local_vertices) dist[v] = INT_MAX;
-        dist[src] = 0;
-        pq.insert({0, src});
-        while (!pq.empty()) {
-            int d = pq.begin()->first;
-            int u = pq.begin()->second;
-            pq.erase(pq.begin());
-            if (d > dist[u]) continue;
-            auto it = local_graph.find(u);
-            if (it != local_graph.end()) {
-                for (const auto& edge : it->second) {
+    
+    std::pair<std::vector<int>, std::vector<int>> computeBellmanFord(int source, int objective_idx) {
+        std::vector<int> dist(V, std::numeric_limits<int>::max());
+        std::vector<int> pred(V, -1);
+        
+        dist[source] = 0;
+        
+        for (int i = 0; i < V - 1; i++) {
+            bool updated = false;
+            for (int u = 0; u < V; u++) {
+                for (const Edge& edge : adj[u]) {
                     int v = edge.dest;
-                    int w = edge.weight;
-                    if (dist.count(v) == 0) dist[v] = INT_MAX; // Initialize if not present
-                    if (dist[u] + w < dist[v]) {
-                        dist[v] = dist[u] + w;
-                        pred[v] = {u};
-                        pq.insert({dist[v], v});
+                    int weight = edge.weights[objective_idx];
+                    int new_dist = (dist[u] == std::numeric_limits<int>::max() || weight == std::numeric_limits<int>::max()) 
+                                  ? std::numeric_limits<int>::max() : dist[u] + weight;
+                    if (new_dist < dist[v]) {
+                        dist[v] = new_dist;
+                        pred[v] = u;
+                        updated = true;
+                    }
+                }
+            }
+            if (!updated) break;
+        }
+        
+        return {dist, pred};
+    }
+    
+    std::pair<std::vector<int>, std::vector<int>> updateLocalSOSP(int source, int objective_idx, 
+                                                                const std::vector<Edge>& update_edges,
+                                                                EdgeOperation op,
+                                                                const std::vector<int>& partition,
+                                                                int part_id, const std::vector<int>& boundary_vertices) {
+        std::vector<int> dist(V, std::numeric_limits<int>::max());
+        std::vector<int> pred(V, -1);
+        std::vector<bool> visited(V, false);
+        std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<>> pq;
+        
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        
+        if (partition[source] == part_id) {
+            dist[source] = 0;
+            pq.push({0, source});
+            if (rank == part_id) {
+                std::cout << "Rank " << rank << ": Source vertex " << source << " initialized with distance 0 for objective " << objective_idx << std::endl;
+            }
+        }
+        
+        for (int v : boundary_vertices) {
+            if (partition[v] == part_id) {
+                dist[v] = std::numeric_limits<int>::max();
+                pred[v] = -1;
+                pq.push({std::numeric_limits<int>::max(), v});
+            }
+        }
+        
+        int visited_count = 0;
+        while (!pq.empty()) {
+            int u = pq.top().second;
+            int u_dist = pq.top().first;
+            pq.pop();
+            
+            if (visited[u] || partition[u] != part_id) continue;
+            visited[u] = true;
+            visited_count++;
+            
+            for (const Edge& edge : adj[u]) {
+                int v = edge.dest;
+                if (op == DELETE) {
+                    bool is_deleted = false;
+                    for (const Edge& del_edge : update_edges) {
+                        if (del_edge.src == edge.src && del_edge.dest == edge.dest) {
+                            is_deleted = true;
+                            break;
+                        }
+                    }
+                    if (is_deleted) continue;
+                }
+                
+                int weight = edge.weights[objective_idx];
+                int new_dist = (u_dist == std::numeric_limits<int>::max() || weight == std::numeric_limits<int>::max()) 
+                              ? std::numeric_limits<int>::max() : u_dist + weight;
+                
+                if (!visited[v] && new_dist < dist[v]) {
+                    dist[v] = new_dist;
+                    pred[v] = u;
+                    pq.push({new_dist, v});
+                }
+            }
+            
+            if (op == INSERT) {
+                for (const Edge& edge : update_edges) {
+                    if (edge.src == u && (partition[edge.dest] == part_id || std::find(boundary_vertices.begin(), boundary_vertices.end(), edge.dest) != boundary_vertices.end())) {
+                        int v = edge.dest;
+                        int weight = edge.weights[objective_idx];
+                        int new_dist = (u_dist == std::numeric_limits<int>::max() || weight == std::numeric_limits<int>::max()) 
+                                      ? std::numeric_limits<int>::max() : u_dist + weight;
+                        if (!visited[v] && new_dist < dist[v]) {
+                            dist[v] = new_dist;
+                            pred[v] = u;
+                            pq.push({new_dist, v});
+                        }
                     }
                 }
             }
         }
-        for (const auto& [dest, d] : dist) {
-            if (d != INT_MAX && dest != src) {
-                Path p;
-                p.total_weight = d;
-                int curr = dest;
-                while (curr != src) {
-                    p.nodes.push_back(curr);
-                    curr = pred[curr][0];
+        
+        if (rank == part_id) {
+            std::cout << "Rank " << rank << ": Visited " << visited_count << " vertices for objective " << objective_idx << std::endl;
+        }
+        
+        return {dist, pred};
+    }
+    
+    std::vector<Path> updateMOSP(int source, const std::vector<Edge>& update_edges, EdgeOperation op) {
+        int rank, size;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &size);
+        
+        // Partition the graph
+        auto [partition, boundary_vertices] = partitionGraph(size);
+        
+        if (rank == 0) {
+            std::cout << "Partitioned graph into " << size << " partitions with " 
+                      << boundary_vertices.size() << " boundary vertices" << std::endl;
+        }
+        
+        // Apply edge updates to local adjacency list
+        if (op == INSERT) {
+            for (const Edge& edge : update_edges) {
+                addEdge(edge.src, edge.dest, edge.weights);
+                addEdge(edge.dest, edge.src, edge.weights);
+            }
+        } else if (op == DELETE) {
+            for (const Edge& edge : update_edges) {
+                removeEdge(edge.src, edge.dest);
+                removeEdge(edge.dest, edge.src);
+            }
+        }
+        
+        std::vector<std::vector<int>> local_distances(num_objectives, std::vector<int>(V, std::numeric_limits<int>::max()));
+        std::vector<std::vector<int>> local_pred(num_objectives, std::vector<int>(V, -1));
+        
+        if (partition[source] == rank) {
+            for (int obj = 0; obj < num_objectives; obj++) {
+                local_distances[obj][source] = 0;
+            }
+        }
+        
+        for (int obj = 0; obj < num_objectives; obj++) {
+            auto sosp_result = updateLocalSOSP(source, obj, update_edges, op, partition, rank, boundary_vertices);
+            local_distances[obj] = sosp_result.first;
+            local_pred[obj] = sosp_result.second;
+        }
+        
+        // Gather all local distances
+        std::vector<int> send_buffer;
+        for (int v = 0; v < V; v++) {
+            for (int obj = 0; obj < num_objectives; obj++) {
+                send_buffer.push_back(local_distances[obj][v]);
+                send_buffer.push_back(local_pred[obj][v]);
+            }
+        }
+        
+        std::vector<int> recv_counts(size), displs(size);
+        int send_count = send_buffer.size();
+        MPI_Allgather(&send_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+        
+        int total_recv = std::accumulate(recv_counts.begin(), recv_counts.end(), 0);
+        std::vector<int> recv_buffer(total_recv);
+        
+        displs[0] = 0;
+        for (int p = 1; p < size; p++) {
+            displs[p] = displs[p-1] + recv_counts[p-1];
+        }
+        
+        MPI_Allgatherv(send_buffer.data(), send_count, MPI_INT,
+                       recv_buffer.data(), recv_counts.data(), displs.data(), MPI_INT, MPI_COMM_WORLD);
+        
+        if (rank == 0) {
+            std::cout << "Rank 0: Received boundary data, total size = " << total_recv << std::endl;
+        }
+        
+        std::vector<std::vector<int>> sosp_distances(num_objectives, std::vector<int>(V, std::numeric_limits<int>::max()));
+        std::vector<std::vector<int>> sosp_pred(num_objectives, std::vector<int>(V, -1));
+        
+        for (int obj = 0; obj < num_objectives; obj++) {
+            sosp_distances[obj][source] = 0;
+        }
+        
+        for (int p = 0; p < size; p++) {
+            int offset = displs[p];
+            for (int v = 0; v < V; v++) {
+                for (int obj = 0; obj < num_objectives; obj++) {
+                    int dist_idx = offset + v * 2 * num_objectives + obj * 2;
+                    int pred_idx = dist_idx + 1;
+                    if (dist_idx < total_recv && recv_buffer[dist_idx] < sosp_distances[obj][v]) {
+                        sosp_distances[obj][v] = recv_buffer[dist_idx];
+                        sosp_pred[obj][v] = recv_buffer[pred_idx];
+                    }
                 }
-                p.nodes.push_back(src);
-                reverse(p.nodes.begin(), p.nodes.end());
-                sosp.push_back(p);
+            }
+        }
+        
+        std::vector<Path> pareto_paths;
+        if (rank == 0) {
+            std::cout << "All distances from source:" << std::endl;
+            for (int v = 0; v < V; v++) {
+                std::cout << "Vertex " << v << ": [";
+                for (int obj = 0; obj < num_objectives; obj++) {
+                    if (sosp_distances[obj][v] == std::numeric_limits<int>::max()) {
+                        std::cout << "INF";
+                    } else {
+                        std::cout << sosp_distances[obj][v];
+                    }
+                    if (obj < num_objectives - 1) std::cout << ", ";
+                }
+                std::cout << "]" << std::endl;
+            }
+            
+            // Construct adjacency list for path reconstruction
+            std::vector<std::vector<std::pair<int, std::vector<int>>>> valid_edges(V);
+            int edge_count = 0;
+            for (int u = 0; u < V; u++) {
+                for (const Edge& edge : adj[u]) {
+                    int v = edge.dest;
+                    bool valid = true;
+                    for (int obj = 0; obj < num_objectives; obj++) {
+                        if (sosp_distances[obj][u] == std::numeric_limits<int>::max() ||
+                            sosp_distances[obj][v] == std::numeric_limits<int>::max() ||
+                            edge.weights[obj] == std::numeric_limits<int>::max() ||
+                            sosp_distances[obj][u] + edge.weights[obj] > sosp_distances[obj][v]) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (valid) {
+                        valid_edges[u].push_back({v, edge.weights});
+                        edge_count++;
+                    }
+                }
+            }
+            std::cout << "Valid edges for path reconstruction: " << edge_count << std::endl;
+            
+            // Reconstruct paths using DFS
+            std::vector<Path> candidate_paths;
+            std::vector<int> current_path = {source};
+            Distance current_dist(num_objectives, 0);
+            std::vector<bool> visited(V, false);
+            visited[source] = true;
+            
+            std::function<void(int)> dfs = [&](int u) {
+                for (const auto& [v, weights] : valid_edges[u]) {
+                    if (!visited[v]) {
+                        Distance new_dist(num_objectives);
+                        bool valid_path = true;
+                        for (int obj = 0; obj < num_objectives; obj++) {
+                            if (current_dist.values[obj] == std::numeric_limits<int>::max() ||
+                                weights[obj] == std::numeric_limits<int>::max()) {
+                                new_dist.values[obj] = std::numeric_limits<int>::max();
+                            } else {
+                                new_dist.values[obj] = current_dist.values[obj] + weights[obj];
+                                if (new_dist.values[obj] > sosp_distances[obj][v]) {
+                                    valid_path = false;
+                                }
+                            }
+                        }
+                        if (!valid_path) continue;
+                        
+                        current_path.push_back(v);
+                        visited[v] = true;
+                        Distance prev_dist = current_dist;
+                        current_dist = new_dist;
+                        
+                        if (sosp_distances[0][v] != std::numeric_limits<int>::max()) {
+                            Path path(num_objectives);
+                            path.nodes = current_path;
+                            path.dist = Distance(num_objectives);
+                            for (int obj = 0; obj < num_objectives; obj++) {
+                                path.dist.values[obj] = sosp_distances[obj][v];
+                            }
+                            candidate_paths.push_back(path);
+                        }
+                        
+                        dfs(v);
+                        
+                        current_path.pop_back();
+                        visited[v] = false;
+                        current_dist = prev_dist;
+                    }
+                }
+            };
+            
+            dfs(source);
+            
+            std::cout << "Candidate paths before filtering (" << candidate_paths.size() << "):" << std::endl;
+            for (size_t i = 0; i < candidate_paths.size(); i++) {
+                const Path& path = candidate_paths[i];
+                std::cout << "Path " << i << ": ";
+                for (int node : path.nodes) std::cout << node << " ";
+                std::cout << "Objectives: ";
+                for (int obj : path.dist.values) {
+                    if (obj == std::numeric_limits<int>::max()) {
+                        std::cout << "INF ";
+                    } else {
+                        std::cout << obj << " ";
+                    }
+                }
+                std::cout << std::endl;
+            }
+            
+            // Filter Pareto-optimal paths
+            for (const Path& path : candidate_paths) {
+                bool dominated = false;
+                for (auto it = pareto_paths.begin(); it != pareto_paths.end();) {
+                    if (it->dist.dominates(path.dist)) {
+                        std::cout << "Path to " << path.nodes.back() << " dominated by path to " << it->nodes.back() << std::endl;
+                        dominated = true;
+                        break;
+                    } else if (path.dist.dominates(it->dist)) {
+                        std::cout << "Path to " << path.nodes.back() << " dominates path to " << it->nodes.back() << std::endl;
+                        it = pareto_paths.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                if (!dominated) {
+                    std::cout << "Adding non-dominated path to " << path.nodes.back() << std::endl;
+                    pareto_paths.push_back(path);
+                }
+            }
+            
+            std::cout << "Final Pareto-optimal paths (" << pareto_paths.size() << "):" << std::endl;
+            for (size_t i = 0; i < pareto_paths.size(); i++) {
+                const Path& path = pareto_paths[i];
+                std::cout << "Path " << i << ": ";
+                for (int node : path.nodes) std::cout << node << " ";
+                std::cout << "Objectives: ";
+                for (int obj : path.dist.values) {
+                    if (obj == std::numeric_limits<int>::max()) {
+                        std::cout << "INF ";
+                    } else {
+                        std::cout << obj << " ";
+                    }
+                }
+                std::cout << std::endl;
+            }
+        }
+        
+        int num_paths = pareto_paths.size();
+        MPI_Bcast(&num_paths, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        
+        return pareto_paths;
+    }
+    
+    std::pair<std::vector<int>, std::vector<int>> computeMOSPWithBellmanFord(int source, int objective_idx) {
+        std::vector<int> dist(V, std::numeric_limits<int>::max());
+        std::vector<int> pred(V, -1);
+        
+        dist[source] = 0;
+        
+        for (int i = 0; i < V - 1; i++) {
+            bool any_change = false;
+            for (int u = 0; u < V; u++) {
+                if (dist[u] == std::numeric_limits<int>::max()) continue;
+                
+                for (const Edge& edge : adj[u]) {
+                    int v = edge.dest;
+                    int weight = edge.weights[objective_idx];
+                    
+                    if (dist[u] + weight < dist[v]) {
+                        dist[v] = dist[u] + weight;
+                        pred[v] = u;
+                        any_change = true;
+                    }
+                }
+            }
+            
+            if (!any_change) break;
+        }
+        
+        return {dist, pred};
+    }
+    
+    std::pair<std::vector<int>, std::vector<int>> partitionGraph(int num_partitions) {
+        std::vector<int> partition(V);
+        std::vector<int> boundary_vertices;
+        
+        idx_t nvtxs = V;
+        idx_t ncon = 1;
+        idx_t nparts = num_partitions;
+        idx_t objval;
+        std::vector<idx_t> xadj(V + 1, 0);
+        std::vector<idx_t> adjncy;
+        std::vector<idx_t> part(V);
+        
+        for (int u = 0; u < V; u++) {
+            xadj[u] = adjncy.size();
+            for (const Edge& edge : adj[u]) {
+                adjncy.push_back(edge.dest);
+            }
+        }
+        xadj[V] = adjncy.size();
+        
+        int ret = METIS_PartGraphKway(&nvtxs, &ncon, xadj.data(), adjncy.data(), NULL, NULL, NULL,
+                                      &nparts, NULL, NULL, NULL, &objval, part.data());
+        if (ret != METIS_OK) {
+            std::cerr << "METIS partitioning failed" << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        
+        for (int v = 0; v < V; v++) {
+            partition[v] = part[v];
+        }
+        
+        std::unordered_set<int> boundary_set;
+        for (int u = 0; u < V; u++) {
+            for (const Edge& edge : adj[u]) {
+                if (partition[u] != partition[edge.dest]) {
+                    boundary_set.insert(u);
+                    boundary_set.insert(edge.dest);
+                }
+            }
+        }
+        boundary_vertices.assign(boundary_set.begin(), boundary_set.end());
+        
+        return {partition, boundary_vertices};
+    }
+};
+
+// Load graph with MPI broadcasting
+Graph loadFacebookGraphMPI(const std::string& filename, int num_objectives, int rank, int size) {
+    Graph graph(0, num_objectives);
+    int V = 0;
+    std::vector<std::tuple<int, int, int>> edge_pairs;
+    
+    if (rank == 0) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Error opening file: " << filename << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        std::string line;
+        std::unordered_set<int> vertices;
+        while (std::getline(file, line)) {
+            if (line[0] == '#') continue;
+            std::istringstream iss(line);
+            int src, dest, weight;
+            if (!(iss >> src >> dest >> weight)) continue;
+            vertices.insert(src);
+            vertices.insert(dest);
+            edge_pairs.push_back({src, dest, weight});
+        }
+        file.close();
+        V = vertices.empty() ? 0 : *std::max_element(vertices.begin(), vertices.end()) + 1;
+    }
+    
+    MPI_Bcast(&V, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    graph = Graph(V, num_objectives);
+    
+    int edge_count = edge_pairs.size();
+    MPI_Bcast(&edge_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    if (rank != 0) {
+        edge_pairs.resize(edge_count);
+    }
+    
+    std::vector<int> edge_data(edge_count * 3);
+    if (rank == 0) {
+        for (size_t i = 0; i < edge_pairs.size(); i++) {
+            edge_data[i * 3] = std::get<0>(edge_pairs[i]);
+            edge_data[i * 3 + 1] = std::get<1>(edge_pairs[i]);
+            edge_data[i * 3 + 2] = std::get<2>(edge_pairs[i]);
+        }
+    }
+    MPI_Bcast(edge_data.data(), edge_count * 3, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    if (rank != 0) {
+        for (int i = 0; i < edge_count; i++) {
+            edge_pairs[i] = {edge_data[i * 3], edge_data[i * 3 + 1], edge_data[i * 3 + 2]};
+        }
+    }
+    
+    for (const auto& [src, dest, weight] : edge_pairs) {
+        std::vector<int> weights(num_objectives);
+        for (int i = 0; i < num_objectives; i++) {
+            weights[i] = weight + i; // Vary weights slightly per objective
+        }
+        graph.addEdge(src, dest, weights);
+        graph.addEdge(dest, src, weights);
+    }
+    
+    return graph;
+}
+
+// Generate new edges and random edge deletions
+std::pair<std::vector<Edge>, std::vector<Edge>> generateEdgeUpdates(const Graph& graph, int num_new_edges, int num_delete_edges) {
+    int num_objectives = graph.getNumObjectives();
+    int V = graph.getV();
+    std::vector<Edge> new_edges;
+    std::vector<Edge> deleted_edges;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> vertex_dist(0, V - 1);
+    std::uniform_int_distribution<> weight_dist(1, 10);
+    
+    std::unordered_set<std::pair<int, int>, pair_hash> existing_edges;
+    for (int u = 0; u < V; u++) {
+        for (const Edge& edge : graph.getAdjList()[u]) {
+            if (u < edge.dest) {
+                existing_edges.emplace(u, edge.dest);
             }
         }
     }
-    return sosp;
-}
-
-// Exchange boundary info (simplified)
-vector<Path> exchange_boundary_info(const vector<Path>& local_sosp, int rank, int size) {
-    vector<Path> all_sosp = local_sosp;
-    for (int src_rank = 0; src_rank < size; ++src_rank) {
-        int len;
-        if (rank == src_rank) {
-            len = local_sosp.size();
+    
+    // Generate new edges
+    for (int i = 0; i < num_new_edges; i++) {
+        int src, dest;
+        do {
+            src = vertex_dist(gen);
+            dest = vertex_dist(gen);
+        } while (src == dest || existing_edges.count({std::min(src, dest), std::max(src, dest)}));
+        
+        std::vector<int> weights(num_objectives);
+        for (int j = 0; j < num_objectives; j++) {
+            weights[j] = weight_dist(gen) + j; // Different weights per objective
         }
-        MPI_Bcast(&len, 1, MPI_INT, src_rank, MPI_COMM_WORLD);
-        vector<int> all_nodes;
-        vector<int> all_weights(len);
-        if (rank == src_rank) {
-            for (const auto& path : local_sosp) {
-                all_nodes.insert(all_nodes.end(), path.nodes.begin(), path.nodes.end());
-                all_weights.push_back(path.total_weight);
-            }
-        }
-        int total_nodes;
-        if (rank == src_rank) {
-            total_nodes = all_nodes.size();
-        }
-        MPI_Bcast(&total_nodes, 1, MPI_INT, src_rank, MPI_COMM_WORLD);
-        all_nodes.resize(total_nodes);
-        MPI_Bcast(all_nodes.data(), total_nodes, MPI_INT, src_rank, MPI_COMM_WORLD);
-        MPI_Bcast(all_weights.data(), len, MPI_INT, src_rank, MPI_COMM_WORLD);
-        if (rank != src_rank) {
-            int node_idx = 0;
-            for (int i = 0; i < len; ++i) {
-                Path p;
-                int nodes_len;
-                if (i == 0) {
-                    nodes_len = total_nodes / len;
-                } else {
-                    nodes_len = all_nodes[node_idx - 1] + 1;
-                }
-                p.nodes.resize(nodes_len);
-                for (int j = 0; j < nodes_len; ++j) {
-                    p.nodes[j] = all_nodes[node_idx++];
-                }
-                p.total_weight = all_weights[i];
-                all_sosp.push_back(p);
+        new_edges.emplace_back(src, dest, weights);
+        existing_edges.emplace(std::min(src, dest), std::max(src, dest));
+    }
+    
+    // Generate edges for deletion, ensuring connectivity
+    std::vector<std::pair<int, int>> all_edges;
+    for (int u = 0; u < V; u++) {
+        for (const Edge& edge : graph.getAdjList()[u]) {
+            if (u < edge.dest) {
+                all_edges.emplace_back(u, edge.dest);
             }
         }
     }
-    return all_sosp;
-}
-
-// Merge partial SOSPs into global SOSP
-vector<Path> merge_sosp(const vector<Path>& all_sosp) {
-    return all_sosp; // Simplified: return all paths
-}
-
-// Compute MOSP (simplified)
-vector<Path> compute_mosp(const vector<Path>& global_sosp) {
-    return global_sosp; // Simplified: return global_sosp as MOSP
-}
-
-// Pareto optimality check
-vector<Path> compute_pareto_set(const vector<Path>& mosp) {
-    vector<Path> pareto_set;
-    for (const auto& p : mosp) {
-        bool dominated = false;
-        for (const auto& q : mosp) {
-            if (q.total_weight < p.total_weight) {
-                dominated = true;
+    
+    std::shuffle(all_edges.begin(), all_edges.end(), gen);
+    num_delete_edges = std::min(num_delete_edges, (int)all_edges.size());
+    
+    // Simple connectivity check using DFS
+    auto is_connected = [&](const std::vector<std::pair<int, int>>& edges_to_remove) {
+        std::vector<std::vector<int>> temp_adj(V);
+        std::unordered_set<std::pair<int, int>, pair_hash> remove_set;
+        for (const auto& e : edges_to_remove) {
+            remove_set.emplace(std::min(e.first, e.second), std::max(e.first, e.second));
+        }
+        for (int u = 0; u < V; u++) {
+            for (const Edge& edge : graph.getAdjList()[u]) {
+                if (!remove_set.count({std::min(u, edge.dest), std::max(u, edge.dest)})) {
+                    temp_adj[u].push_back(edge.dest);
+                }
+            }
+        }
+        std::vector<bool> visited(V, false);
+        std::function<void(int)> dfs = [&](int v) {
+            visited[v] = true;
+            for (int u : temp_adj[v]) {
+                if (!visited[u]) dfs(u);
+            }
+        };
+        dfs(0);
+        return std::all_of(visited.begin(), visited.end(), [](bool v) { return v; });
+    };
+    
+    std::vector<std::pair<int, int>> selected_edges;
+    for (int i = 0; i < num_delete_edges && i < (int)all_edges.size(); i++) {
+        selected_edges.push_back(all_edges[i]);
+        if (!is_connected(selected_edges)) {
+            selected_edges.pop_back();
+        }
+    }
+    
+    for (const auto& [src, dest] : selected_edges) {
+        std::vector<int> weights(num_objectives, 0);
+        for (const Edge& edge : graph.getAdjList()[src]) {
+            if (edge.dest == dest) {
+                weights = edge.weights;
                 break;
             }
         }
-        if (!dominated) pareto_set.push_back(p);
+        deleted_edges.emplace_back(src, dest, weights);
     }
-    return pareto_set;
+    
+    return {new_edges, deleted_edges};
 }
 
-// Count edges in graph
-int count_edges(const map<int, vector<Edge>>& graph) {
-    int edges = 0;
-    for (const auto& [v, e] : graph) edges += e.size();
-    return edges;
-}
-
-// Broadcast graph to all processes
-void broadcast_graph(map<int, vector<Edge>>& full_graph, int& num_vertices, int& num_edges, int rank) {
-    MPI_Bcast(&num_vertices, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&num_edges, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    vector<int> serialized;
-    if (rank == 0) {
-        for (const auto& [v, edges] : full_graph) {
-            for (const auto& e : edges) {
-                serialized.push_back(v);
-                serialized.push_back(e.dest);
-                serialized.push_back(e.weight);
+// Save results
+void saveResults(const std::string& filename, 
+                const std::vector<Path>& insert_paths, 
+                const std::vector<std::vector<int>>& insert_distances,
+                const std::vector<Path>& delete_paths, 
+                const std::vector<std::vector<int>>& delete_distances,
+                int num_objectives,
+                double insert_time,
+                double delete_time) {
+    std::ofstream file(filename, std::ios::app); // Append to avoid overwriting
+    if (!file.is_open()) {
+        std::cerr << "Error opening output file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "=== Edge Insertion ===\n";
+    file << "Execution Time: " << insert_time << " seconds\n";
+    file << "Number of Pareto-optimal paths: " << insert_paths.size() << "\n\n";
+    
+    file << "Pareto-optimal Paths:\n";
+    for (size_t p = 0; p < insert_paths.size(); ++p) {
+        const Path& path = insert_paths[p];
+        file << "Path from " << path.nodes.front() << " to " << path.nodes.back() << ": ";
+        file << "Nodes: [";
+        for (size_t i = 0; i < path.nodes.size(); i++) {
+            file << path.nodes[i];
+            if (i < path.nodes.size() - 1) file << ", ";
+        }
+        file << "] Objectives: [";
+        for (size_t i = 0; i < path.dist.values.size(); i++) {
+            if (path.dist.values[i] == std::numeric_limits<int>::max()) {
+                file << "INF";
+            } else {
+                file << path.dist.values[i];
             }
+            if (i < path.dist.values.size() - 1) file << ", ";
         }
+        file << "]\n";
     }
-    int len = serialized.size();
-    MPI_Bcast(&len, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (rank != 0) serialized.resize(len);
-    MPI_Bcast(serialized.data(), len, MPI_INT, 0, MPI_COMM_WORLD);
-    if (rank != 0) {
-        full_graph.clear();
-        for (int i = 0; i < len; i += 3) {
-            int src = serialized[i];
-            int dest = serialized[i + 1];
-            int weight = serialized[i + 2];
-            full_graph[src].push_back({dest, weight});
-            full_graph[dest]; // Ensure dest exists
-        }
-    }
-}
-
-// User menu for graph updates
-void user_menu(map<int, vector<Edge>>& full_graph, int& num_vertices, int& num_edges, int rank) {
-    if (rank != 0) return;
-    while (true) {
-        cout << "\nUser Menu:\n1. Insert node\n2. Delete node\n3. Insert edge\n4. Delete edge\n5. Exit\nEnter choice: ";
-        int choice;
-        cin >> choice;
-        if (choice == 5) break;
-        if (choice == 1) {
-            int new_node = num_vertices++;
-            full_graph[new_node] = {};
-            cout << "Node " << new_node << " added.\n";
-        } else if (choice == 2) {
-            int node;
-            cout << "Enter node to delete: ";
-            cin >> node;
-            if (full_graph.erase(node)) {
-                for (auto& [v, edges] : full_graph) {
-                    edges.erase(remove_if(edges.begin(), edges.end(),
-                                          [node](const Edge& e) { return e.dest == node; }), edges.end());
-                }
-                num_edges = count_edges(full_graph);
-                cout << "Node " << node << " deleted.\n";
+    
+    file << "\nDistances from Source (Insertion):\n";
+    for (size_t v = 0; v < insert_distances[0].size(); v++) {
+        file << "Vertex " << v << ": [";
+        for (int obj = 0; obj < num_objectives; obj++) {
+            if (insert_distances[obj][v] == std::numeric_limits<int>::max()) {
+                file << "INF";
+            } else {
+                file << insert_distances[obj][v];
             }
-        } else if (choice == 3) {
-            int src, dest, weight;
-            cout << "Enter source, destination, weight: ";
-            cin >> src >> dest >> weight;
-            full_graph[src].push_back({dest, weight});
-            full_graph[dest]; // Ensure dest exists
-            num_edges++;
-            cout << "Edge " << src << "->" << dest << " added.\n";
-        } else if (choice == 4) {
-            int src, dest;
-            cout << "Enter source, destination: ";
-            cin >> src >> dest;
-            auto& edges = full_graph[src];
-            edges.erase(remove_if(edges.begin(), edges.end(),
-                                  [dest](const Edge& e) { return e.dest == dest; }), edges.end());
-            num_edges = count_edges(full_graph);
-            cout << "Edge " << src << "->" << dest << " deleted.\n";
+            if (obj < num_objectives - 1) file << ", ";
         }
-        broadcast_graph(full_graph, num_vertices, num_edges, rank);
+        file << "]\n";
     }
+    
+    file << "\n=== Edge Deletion ===\n";
+    file << "Execution Time: " << delete_time << " seconds\n";
+    file << "Number of Pareto-optimal paths: " << delete_paths.size() << "\n\n";
+    
+    file << "Pareto-optimal Paths:\n";
+    for (size_t p = 0; p < delete_paths.size(); ++p) {
+        const Path& path = delete_paths[p];
+        file << "Path from " << path.nodes.front() << " to " << path.nodes.back() << ": ";
+        file << "Nodes: [";
+        for (size_t i = 0; i < path.nodes.size(); i++) {
+            file << path.nodes[i];
+            if (i < path.nodes.size() - 1) file << ", ";
+        }
+        file << "] Objectives: [";
+        for (size_t i = 0; i < path.dist.values.size(); i++) {
+            if (path.dist.values[i] == std::numeric_limits<int>::max()) {
+                file << "INF";
+            } else {
+                file << path.dist.values[i];
+            }
+            if (i < path.dist.values.size() - 1) file << ", ";
+        }
+        file << "]\n";
+    }
+    
+    file << "\nDistances from Source (Deletion):\n";
+    for (size_t v = 0; v < delete_distances[0].size(); v++) {
+        file << "Vertex " << v << ": [";
+        for (int obj = 0; obj < num_objectives; obj++) {
+            if (delete_distances[obj][v] == std::numeric_limits<int>::max()) {
+                file << "INF";
+            } else {
+                file << delete_distances[obj][v];
+            }
+            if (obj < num_objectives - 1) file << ", ";
+        }
+        file << "]\n";
+    }
+    
+    file << "\n";
+    file.close();
 }
 
 int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
+    
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    map<int, vector<Edge>> full_graph, local_graph;
-    int num_vertices = 0, num_edges = 0;
-    vector<int> local_vertices;
-
-    // Step 1: Read graph (Master only)
-    if (rank == 0) {
-        full_graph = read_graph("weightedfacebook_graph.txt", num_vertices, num_edges);
-    }
-    broadcast_graph(full_graph, num_vertices, num_edges, rank);
-
-    // Step 2: Partition graph using METIS
-    vector<idx_t> xadj, adjncy, adjwgt, part;
-    if (rank == 0) {
-        graph_to_metis(full_graph, num_vertices, xadj, adjncy, adjwgt);
-        partition_graph(num_vertices, size, xadj, adjncy, adjwgt, part);
-    }
-    part.resize(num_vertices);
-    MPI_Bcast(part.data(), num_vertices, MPI_INT, 0, MPI_COMM_WORLD);
-    distribute_partitions(full_graph, part, rank, size, local_graph, local_vertices);
-
-    // Step 3: Compute SOSP
-    vector<Path> local_sosp = compute_sosp(local_graph, local_vertices);
-    vector<Path> all_sosp = exchange_boundary_info(local_sosp, rank, size);
-    vector<Path> global_sosp = merge_sosp(all_sosp);
-
-    // Step 4 & 5: Compute MOSP
-    vector<Path> mosp = compute_mosp(global_sosp);
-
-    // Step 6: Pareto optimality
-    vector<Path> pareto_set = compute_pareto_set(mosp);
-
-    // Output Pareto optimal paths
-    if (rank == 0) {
-        cout << "Pareto Optimal Paths:\n";
-        for (const auto& p : pareto_set) {
-            cout << "Path: ";
-            for (int v : p.nodes) cout << v << " ";
-            cout << "Weight: " << p.total_weight << endl;
+    
+    std::string graph_file = "weightedfacebook_graph.txt";
+    int num_objectives = 5;
+    int source_vertex = 0;
+    int num_new_edges = 10;
+    int num_delete_edges = 2;
+    std::string output_file = "results.txt";
+    
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--graph" && i + 1 < argc) {
+            graph_file = argv[++i];
+        } else if (arg == "--objectives" && i + 1 < argc) {
+            num_objectives = std::stoi(argv[++i]);
+        } else if (arg == "--source" && i + 1 < argc) {
+            source_vertex = std::stoi(argv[++i]);
+        } else if (arg == "--new-edges" && i + 1 < argc) {
+            num_new_edges = std::stoi(argv[++i]);
+        } else if (arg == "--delete-edges" && i + 1 < argc) {
+            num_delete_edges = std::stoi(argv[++i]);
+        } else if (arg == "--output" && i + 1 < argc) {
+            output_file = argv[++i];
         }
     }
-
-    // Step 7: User menu
-    user_menu(full_graph, num_vertices, num_edges, rank);
-
+    
+    if (rank == 0) {
+        std::ofstream file(output_file, std::ios::trunc); // Clear output file
+        file.close();
+        std::cout << "Starting Parallel MOSP algorithm with:" << std::endl;
+        std::cout << "- MPI Processes: " << size << std::endl;
+        std::cout << "- Graph file: " << graph_file << std::endl;
+        std::cout << "- Number of objectives: " << num_objectives << std::endl;
+        std::cout << "- Source vertex: " << source_vertex << std::endl;
+        std::cout << "- Number of new edges: " << num_new_edges << std::endl;
+        std::cout << "- Number of edges to delete: " << num_delete_edges << std::endl;
+    }
+    
+    Graph graph = loadFacebookGraphMPI(graph_file, num_objectives, rank, size);
+    
+    if (rank == 0) {
+        std::cout << "Loaded graph with " << graph.getV() << " vertices" << std::endl;
+    }
+    
+    auto [new_edges, deleted_edges] = generateEdgeUpdates(graph, num_new_edges, num_delete_edges);
+    
+    if (rank == 0) {
+        std::cout << "Generated " << new_edges.size() << " new edges and " << deleted_edges.size() << " edges for deletion" << std::endl;
+        std::cout << "Sample new edge weights:" << std::endl;
+        for (size_t i = 0; i < std::min(size_t(5), new_edges.size()); i++) {
+            std::cout << "Edge " << new_edges[i].src << "->" << new_edges[i].dest << ": ";
+            for (int w : new_edges[i].weights) std::cout << w << " ";
+            std::cout << std::endl;
+        }
+    }
+    
+    // Edge Insertion
+    if (rank == 0) {
+        std::cout << "Starting parallel MOSP update for edge insertion..." << std::endl;
+    }
+    
+    std::chrono::high_resolution_clock::time_point insert_start_time;
+    if (rank == 0) {
+        insert_start_time = std::chrono::high_resolution_clock::now();
+    }
+    
+    std::vector<Path> insert_paths = graph.updateMOSP(source_vertex, new_edges, EdgeOperation::INSERT);
+    
+    double insert_execution_time = 0.0;
+    std::vector<std::vector<int>> insert_distances(num_objectives, std::vector<int>(graph.getV(), std::numeric_limits<int>::max()));
+    if (rank == 0) {
+        std::chrono::high_resolution_clock::time_point insert_end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> insert_elapsed = insert_end_time - insert_start_time;
+        insert_execution_time = insert_elapsed.count();
+        
+        std::cout << "MOSP update for insertion completed in " << insert_execution_time << " seconds" << std::endl;
+        std::cout << "Found " << insert_paths.size() << " Pareto-optimal paths" << std::endl;
+        
+        for (int obj = 0; obj < num_objectives; obj++) {
+            auto [dist, pred] = graph.computeSOSP(source_vertex, obj);
+            insert_distances[obj] = dist;
+        }
+        
+        for (size_t p = 0; p < insert_paths.size(); ++p) {
+            const Path& path = insert_paths[p];
+            std::cout << "Path from " << path.nodes.front() << " to " << path.nodes.back() << ": ";
+            std::cout << "Nodes: [";
+            for (size_t i = 0; i < path.nodes.size(); i++) {
+                std::cout << path.nodes[i];
+                if (i < path.nodes.size() - 1) std::cout << ", ";
+            }
+            std::cout << "] Objectives: [";
+            for (size_t i = 0; i < path.dist.values.size(); i++) {
+                if (path.dist.values[i] == std::numeric_limits<int>::max()) {
+                    std::cout << "INF";
+                } else {
+                    std::cout << path.dist.values[i];
+                }
+                if (i < path.dist.values.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]\n";
+        }
+    }
+    
+    // Edge Deletion (reload graph to reset state)
+    graph = loadFacebookGraphMPI(graph_file, num_objectives, rank, size);
+    
+    if (rank == 0) {
+        std::cout << "\nStarting parallel MOSP update for edge deletion..." << std::endl;
+    }
+    
+    std::chrono::high_resolution_clock::time_point delete_start_time;
+    if (rank == 0) {
+        delete_start_time = std::chrono::high_resolution_clock::now();
+    }
+    
+    std::vector<Path> delete_paths = graph.updateMOSP(source_vertex, deleted_edges, EdgeOperation::DELETE);
+    
+    double delete_execution_time = 0.0;
+    std::vector<std::vector<int>> delete_distances(num_objectives, std::vector<int>(graph.getV(), std::numeric_limits<int>::max()));
+    if (rank == 0) {
+        std::chrono::high_resolution_clock::time_point delete_end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> delete_elapsed = delete_end_time - delete_start_time;
+        delete_execution_time = delete_elapsed.count();
+        
+        std::cout << "MOSP update for deletion completed in " << delete_execution_time << " seconds" << std::endl;
+        std::cout << "Found " << delete_paths.size() << " Pareto-optimal paths" << std::endl;
+        
+        for (int obj = 0; obj < num_objectives; obj++) {
+            auto [dist, pred] = graph.computeSOSP(source_vertex, obj);
+            delete_distances[obj] = dist;
+        }
+        
+        for (size_t p = 0; p < delete_paths.size(); ++p) {
+            const Path& path = delete_paths[p];
+            std::cout << "Path from " << path.nodes.front() << " to " << path.nodes.back() << ": ";
+            std::cout << "Nodes: [";
+            for (size_t i = 0; i < path.nodes.size(); i++) {
+                std::cout << path.nodes[i];
+                if (i < path.nodes.size() - 1) std::cout << ", ";
+            }
+            std::cout << "] Objectives: [";
+            for (size_t i = 0; i < path.dist.values.size(); i++) {
+                if (path.dist.values[i] == std::numeric_limits<int>::max()) {
+                    std::cout << "INF";
+                } else {
+                    std::cout << path.dist.values[i];
+                }
+                if (i < path.dist.values.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]\n";
+        }
+        
+        saveResults(output_file, insert_paths, insert_distances, delete_paths, delete_distances, 
+                    num_objectives, insert_execution_time, delete_execution_time);
+    }
+    
     MPI_Finalize();
     return 0;
 }

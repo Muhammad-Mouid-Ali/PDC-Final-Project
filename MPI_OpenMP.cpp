@@ -850,172 +850,129 @@ void saveResults(const std::string& filename,
 
 int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
-    
+
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    
+
     std::string graph_file = "weightedfacebook_graph.txt";
     int num_objectives = 5;
     int source_vertex = 0;
-    int num_new_edges = 10;
-    int num_delete_edges = 2;
     std::string output_file = "results.txt";
     int num_threads = omp_get_max_threads();
-    
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--graph" && i + 1 < argc) {
-            graph_file = argv[++i];
-        } else if (arg == "--objectives" && i + 1 < argc) {
-            num_objectives = std::stoi(argv[++i]);
-        } else if (arg == "--source" && i + 1 < argc) {
-            source_vertex = std::stoi(argv[++i]);
-        } else if (arg == "--new-edges" && i + 1 < argc) {
-            num_new_edges = std::stoi(argv[++i]);
-        } else if (arg == "--delete-edges" && i + 1 < argc) {
-            num_delete_edges = std::stoi(argv[++i]);
-        } else if (arg == "--output" && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg == "--threads" && i + 1 < argc) {
-            num_threads = std::stoi(argv[++i]);
-        }
-    }
-    
+
     omp_set_num_threads(num_threads);
-    
+
     if (rank == 0) {
-        std::ofstream file(output_file, std::ios::trunc); // Clear output file
+        std::ofstream file(output_file, std::ios::trunc); // Clear previous output
         file.close();
-        std::cout << "Starting Parallel MOSP algorithm with:" << std::endl;
-        std::cout << "- MPI Processes: " << size << std::endl;
-        std::cout << "- OpenMP Threads per process: " << num_threads << std::endl;
-        std::cout << "- Graph file: " << graph_file << std::endl;
-        std::cout << "- Number of objectives: " << num_objectives << std::endl;
-        std::cout << "- Source vertex: " << source_vertex << std::endl;
-        std::cout << "- Number of new edges: " << num_new_edges << std::endl;
-        std::cout << "- Number of edges to delete: " << num_delete_edges << std::endl;
+        std::cout << "MPI + OpenMP + METIS Hybrid MOSP initialized.\n";
     }
-    
+
     Graph graph = loadFacebookGraphMPI(graph_file, num_objectives, rank, size);
-    
+
     if (rank == 0) {
-        std::cout << "Loaded graph with " << graph.getV() << " vertices" << std::endl;
+        std::cout << "Loaded graph with " << graph.getV() << " vertices\n";
     }
-    
-    auto [new_edges, deleted_edges] = generateEdgeUpdates(graph, num_new_edges, num_delete_edges);
-    
-    if (rank == 0) {
-        std::cout << "Generated " << new_edges.size() << " new edges and " << deleted_edges.size() << " edges for deletion" << std::endl;
-        std::cout << "Sample new edge weights:" << std::endl;
-        for (size_t i = 0; i < std::min(size_t(5), new_edges.size()); i++) {
-            std::cout << "Edge " << new_edges[i].src << "->" << new_edges[i].dest << ": ";
-            for (int w : new_edges[i].weights) std::cout << w << " ";
-            std::cout << std::endl;
+
+    // Menu loop
+    bool running = true;
+    while (running) {
+        int choice = -1;
+
+        if (rank == 0) {
+            std::cout << "\n========= MENU =========\n";
+            std::cout << "1. Add Edge\n";
+            std::cout << "2. Remove Edge\n";
+            std::cout << "3. Exit\n";
+            std::cout << "Enter choice: ";
+            std::cin >> choice;
         }
-    }
-    
-    // Edge Insertion
-    if (rank == 0) {
-        std::cout << "Starting parallel MOSP update for edge insertion..." << std::endl;
-    }
-    
-    std::chrono::high_resolution_clock::time_point insert_start_time;
-    if (rank == 0) {
-        insert_start_time = std::chrono::high_resolution_clock::now();
-    }
-    
-    std::vector<Path> insert_paths = graph.updateMOSP(source_vertex, new_edges, EdgeOperation::INSERT);
-    
-    double insert_execution_time = 0.0;
-    std::vector<std::vector<int>> insert_distances(num_objectives, std::vector<int>(graph.getV(), std::numeric_limits<int>::max()));
-    if (rank == 0) {
-        std::chrono::high_resolution_clock::time_point insert_end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> insert_elapsed = insert_end_time - insert_start_time;
-        insert_execution_time = insert_elapsed.count();
-        
-        std::cout << "MOSP update for insertion completed in " << insert_execution_time << " seconds" << std::endl;
-        std::cout << "Found " << insert_paths.size() << " Pareto-optimal paths" << std::endl;
-        
-        for (int obj = 0; obj < num_objectives; obj++) {
-            auto [dist, pred] = graph.computeSOSP(source_vertex, obj);
-            insert_distances[obj] = dist;
-        }
-        
-        for (size_t p = 0; p < insert_paths.size(); ++p) {
-            const Path& path = insert_paths[p];
-            std::cout << "Path from " << path.nodes.front() << " to " << path.nodes.back() << ": ";
-            std::cout << "Nodes: [";
-            for (size_t i = 0; i < path.nodes.size(); i++) {
-                std::cout << path.nodes[i];
-                if (i < path.nodes.size() - 1) std::cout << ", ";
+
+        // Broadcast choice to all processes
+        MPI_Bcast(&choice, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        if (choice == 1) {
+            int src, dest;
+            std::vector<int> weights(num_objectives);
+
+            if (rank == 0) {
+                std::cout << "Enter source vertex: ";
+                std::cin >> src;
+                std::cout << "Enter destination vertex: ";
+                std::cin >> dest;
+                std::cout << "Enter " << num_objectives << " weights separated by space: ";
+                for (int &w : weights) std::cin >> w;
             }
-            std::cout << "] Objectives: [";
-            for (size_t i = 0; i < path.dist.values.size(); i++) {
-                if (path.dist.values[i] == std::numeric_limits<int>::max()) {
-                    std::cout << "INF";
-                } else {
-                    std::cout << path.dist.values[i];
+
+            // Broadcast edge data
+            MPI_Bcast(&src, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            MPI_Bcast(&dest, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            MPI_Bcast(weights.data(), num_objectives, MPI_INT, 0, MPI_COMM_WORLD);
+
+            std::vector<Edge> new_edge = { Edge(src, dest, weights) };
+
+            if (rank == 0) {
+                std::cout << "Updating graph by adding edge...\n";
+            }
+
+            auto insert_paths = graph.updateMOSP(source_vertex, new_edge, INSERT);
+
+            if (rank == 0) {
+                std::cout << "Edge inserted. Found " << insert_paths.size() << " Pareto-optimal paths.\n";
+            }
+
+        } else if (choice == 2) {
+            int src, dest;
+
+            if (rank == 0) {
+                std::cout << "Enter source vertex to remove edge: ";
+                std::cin >> src;
+                std::cout << "Enter destination vertex to remove edge: ";
+                std::cin >> dest;
+            }
+
+            // Broadcast edge data
+            MPI_Bcast(&src, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            MPI_Bcast(&dest, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+            // Find current edge weights (rank 0 only)
+            std::vector<int> weights(num_objectives, 0);
+            if (rank == 0) {
+                for (const Edge& edge : graph.getAdjList()[src]) {
+                    if (edge.dest == dest) {
+                        weights = edge.weights;
+                        break;
+                    }
                 }
-                if (i < path.dist.values.size() - 1) std::cout << ", ";
             }
-            std::cout << "]\n";
-        }
-    }
-    
-    // Edge Deletion (reload graph to reset state)
-    graph = loadFacebookGraphMPI(graph_file, num_objectives, rank, size);
-    
-    if (rank == 0) {
-        std::cout << "\nStarting parallel MOSP update for edge deletion..." << std::endl;
-    }
-    
-    std::chrono::high_resolution_clock::time_point delete_start_time;
-    if (rank == 0) {
-        delete_start_time = std::chrono::high_resolution_clock::now();
-    }
-    
-    std::vector<Path> delete_paths = graph.updateMOSP(source_vertex, deleted_edges, EdgeOperation::DELETE);
-    
-    double delete_execution_time = 0.0;
-    std::vector<std::vector<int>> delete_distances(num_objectives, std::vector<int>(graph.getV(), std::numeric_limits<int>::max()));
-    if (rank == 0) {
-        std::chrono::high_resolution_clock::time_point delete_end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> delete_elapsed = delete_end_time - delete_start_time;
-        delete_execution_time = delete_elapsed.count();
-        
-        std::cout << "MOSP update for deletion completed in " << delete_execution_time << " seconds" << std::endl;
-        std::cout << "Found " << delete_paths.size() << " Pareto-optimal paths" << std::endl;
-        
-        for (int obj = 0; obj < num_objectives; obj++) {
-            auto [dist, pred] = graph.computeSOSP(source_vertex, obj);
-            delete_distances[obj] = dist;
-        }
-        
-        for (size_t p = 0; p < delete_paths.size(); ++p) {
-            const Path& path = delete_paths[p];
-            std::cout << "Path from " << path.nodes.front() << " to " << path.nodes.back() << ": ";
-            std::cout << "Nodes: [";
-            for (size_t i = 0; i < path.nodes.size(); i++) {
-                std::cout << path.nodes[i];
-                if (i < path.nodes.size() - 1) std::cout << ", ";
+
+            MPI_Bcast(weights.data(), num_objectives, MPI_INT, 0, MPI_COMM_WORLD);
+
+            std::vector<Edge> del_edge = { Edge(src, dest, weights) };
+
+            if (rank == 0) {
+                std::cout << "Updating graph by deleting edge...\n";
             }
-            std::cout << "] Objectives: [";
-            for (size_t i = 0; i < path.dist.values.size(); i++) {
-                if (path.dist.values[i] == std::numeric_limits<int>::max()) {
-                    std::cout << "INF";
-                } else {
-                    std::cout << path.dist.values[i];
-                }
-                if (i < path.dist.values.size() - 1) std::cout << ", ";
+
+            auto delete_paths = graph.updateMOSP(source_vertex, del_edge, DELETE);
+
+            if (rank == 0) {
+                std::cout << "Edge deleted. Found " << delete_paths.size() << " Pareto-optimal paths.\n";
             }
-            std::cout << "]\n";
+
+        } else if (choice == 3) {
+            running = false;
+            if (rank == 0) std::cout << "Exiting...\n";
+        } else {
+            if (rank == 0) std::cout << "Invalid choice. Please try again.\n";
         }
-        
-        saveResults(output_file, insert_paths, insert_distances, delete_paths, delete_distances, 
-                    num_objectives, insert_execution_time, delete_execution_time);
+
+        // Broadcast running flag to all processes
+        MPI_Bcast(&running, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
     }
-    
+
     MPI_Finalize();
     return 0;
 }
+
